@@ -5,8 +5,9 @@
 
 import math
 import torch
+import sys
+sys.path.append('/home/tachennf/Documents/MRI-pH-Hypoxia/torchcde')
 import torchcde
-
 
 ######################
 # A CDE model looks like
@@ -128,14 +129,19 @@ def get_data(num_timepoints=100):
 
 
 def main(num_epochs=30):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print('Using device:', device)
+
     train_X, train_y = get_data()
+    train_X = train_X.to(device)
+    train_y = train_y.to(device)
 
     ######################
     # input_channels=3 because we have both the horizontal and vertical position of a point in the spiral, and time.
     # hidden_channels=8 is the number of hidden channels for the evolving z_t, which we get to choose.
     # output_channels=1 because we're doing binary classification.
     ######################
-    model = NeuralCDE(input_channels=3, hidden_channels=8, output_channels=1)
+    model = NeuralCDE(input_channels=3, hidden_channels=8, output_channels=1).to(device)
     optimizer = torch.optim.Adam(model.parameters())
 
     ######################
