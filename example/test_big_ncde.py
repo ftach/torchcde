@@ -1,13 +1,9 @@
-######################
-# So you want to train a Neural CDE model?
-# Let's get started!
-######################
-
 import math
 import torch
 import sys
 sys.path.append('/home/tachennf/Documents/MRI-pH-Hypoxia/torchcde')
 import torchcde
+
 
 ######################
 # A CDE model looks like
@@ -21,8 +17,8 @@ import torchcde
 class CDEFunc(torch.nn.Module):
     def __init__(self, input_channels, hidden_channels):
         ######################
-        # input_channels is the number of input channels in the data X. (Determined by the data.)
-        # hidden_channels is the number of channels for z_t. (Determined by you!)
+        # input_channels is the number of input channels in the data X. It's the number of offsets in the data.
+        # hidden_channels is the number of channels for z_t.
         ######################
         super(CDEFunc, self).__init__()
         self.input_channels = input_channels
@@ -52,16 +48,110 @@ class CDEFunc(torch.nn.Module):
         return z
 
 
+class FTheta(torch.nn.Module):
+    # Based on the table from Kuppens et al. 
+    def __init__(self, input_channels, hidden_channels):
+        ######################
+        # input_channels is the number of input channels in the data X. It's the batch size.
+        # hidden_channels is the number of channels for z_t. It's the number of parameters to estimate.
+        ######################
+        super(FTheta, self).__init__()
+        self.input_channels = input_channels
+        self.hidden_channels = hidden_channels
+
+        self.linear1 = torch.nn.Linear(hidden_channels, 128)
+        self.linear2 = torch.nn.Linear(128, 256)
+        self.linear3 = torch.nn.Linear(256, 512)
+        self.linear4 = torch.nn.Linear(512, 256)
+        self.linear5 = torch.nn.Linear(256, 128)
+        self.linear6 = torch.nn.Linear(128, input_channels * hidden_channels)
+
+    ######################
+    # For most purposes the t argument can probably be ignored; unless you want your CDE to behave differently at
+    # different times, which would be unusual. But it's there if you need it!
+    ######################
+    def forward(self, t, z):
+        # z has shape (batch, hidden_channels)
+        z = self.linear1(z)
+        z = z.relu()
+        z = self.linear2(z)
+        z = z.relu()
+        z = self.linear3(z)
+        z = z.relu()
+        z = self.linear4(z)
+        z = z.relu()
+        z = self.linear5(z)
+        z = z.relu()
+        z = self.linear6(z)
+        ######################
+        # Easy-to-forget gotcha: Best results tend to be obtained by adding a final tanh nonlinearity.
+        ######################
+        z = z.tanh()
+        ######################
+        # Ignoring the batch dimension, the shape of the output tensor must be a matrix,
+        # because we need it to represent a linear map from R^input_channels to R^hidden_channels.
+        ######################
+        z = z.view(z.size(0), self.hidden_channels, self.input_channels)
+        return z
+    
+class LTheta2(torch.nn.Module):
+    # Based on the table from Kuppens et al. 
+    def __init__(self, input_channels, hidden_channels, output_channels):
+        ######################
+        # input_channels is the number of input channels in the data X. It's the batch size.
+        # hidden_channels is the number of channels for z_t. It's the number of parameters to estimate.
+        # output_channels is the number of output channels in the prediction. 2 for binary classification, m for the number of parameters to estimate in regression.
+        ######################
+        super(LTheta2, self).__init__()
+        self.input_channels = input_channels
+        self.hidden_channels = hidden_channels
+
+        self.linear1 = torch.nn.Linear(hidden_channels, hidden_channels) # input_channels *hidden_channels
+        self.linear2 = torch.nn.Linear(hidden_channels, hidden_channels)
+        self.linear3 = torch.nn.Linear(hidden_channels, output_channels)
+        self.batchnorm = torch.nn.BatchNorm1d(hidden_channels)
+
+    ######################
+    # For most purposes the t argument can probably be ignored; unless you want your CDE to behave differently at
+    # different times, which would be unusual. But it's there if you need it!
+    ######################
+    def forward(self, t, z):
+        # z has shape (batch, input_channels*hidden_channels)
+        z = self.linear1(z)
+        z = self.batchnorm(z)
+        z = z.relu()
+
+        z = self.linear2(z)
+        z = self.batchnorm(z)
+        z = z.relu()
+        z = self.linear2(z)
+        z = self.batchnorm(z)
+        z = z.relu()
+        z = self.linear2(z)
+        z = self.batchnorm(z)
+        z = z.relu()
+        z = self.linear2(z)
+        z = self.batchnorm(z)
+        z = z.relu()        
+
+        z = self.linear3(z)
+
+        return z
+    
+
 ######################
 # Next, we need to package CDEFunc up into a model that computes the integral.
 ######################
 class NeuralCDE(torch.nn.Module):
     def __init__(self, input_channels, hidden_channels, output_channels, interpolation="cubic"):
+        ######################
+        # input_channels is the number of input channels in the data X. (Determined by the data.)
+        # hidden_channels is the number of channels for z_t. (Determined by you!)
+        # output_channels is the number of output channels in the prediction. 2 for binary classification, m for the number of parameters to estimate in regression.
         super(NeuralCDE, self).__init__()
-
-        self.func = CDEFunc(input_channels, hidden_channels)
-        self.initial = torch.nn.Linear(input_channels, hidden_channels)
-        self.readout = torch.nn.Linear(hidden_channels, output_channels)
+        self.initial = torch.nn.Linear(input_channels, hidden_channels) # ltheta1, the initial value of z_t
+        self.func = FTheta(input_channels, hidden_channels) # func is ftheta, the function that defines the CDE
+        self.readout = LTheta2(input_channels, hidden_channels, output_channels) # ltheta2, the readout function that maps the final value of z_t to the output
         self.interpolation = interpolation
 
     def forward(self, coeffs):
@@ -76,23 +166,24 @@ class NeuralCDE(torch.nn.Module):
         # Easy to forget gotcha: Initial hidden state should be a function of the first observation.
         ######################
         X0 = X.evaluate(X.interval[0])
-        z0 = self.initial(X0)
+        z0 = self.initial(X0) # ltheta1 is initial 
 
         ######################
         # Actually solve the CDE.
         ######################
-        z_T = torchcde.cdeint(X=X, # shape (batch, )
+        z_T = torchcde.cdeint(X=X, # This will be a tensor of shape (..., len(t)-1, hidden_channels).
                               z0=z0,
-                              func=self.func,
-                              t=X.interval)
+                              func=self.func, # func is ftheta 
+                              t=X.interval) 
 
         ######################
-        # Both the initial value and the terminal value are returned from cdeint; extract just the terminal value,
+        # Both the initial value and the terminal value are returned from cdeint; extract just the terminal value (not z0),
         # and then apply a linear map.
         ######################
         z_T = z_T[:, 1]
-        pred_y = self.readout(z_T)
+        pred_y = self.readout(X.interval, z_T) # readout is ltheta2
         return pred_y
+    
 
 
 ######################
@@ -163,6 +254,8 @@ def main(num_epochs=30):
         print('Epoch: {}   Training loss: {}'.format(epoch, loss.item()))
 
     test_X, test_y = get_data()
+    test_X = test_X.to(device)
+    test_y = test_y.to(device)
     test_coeffs = torchcde.hermite_cubic_coefficients_with_backward_differences(test_X)
     pred_y = model(test_coeffs).squeeze(-1)
     binary_prediction = (torch.sigmoid(pred_y) > 0.5).to(test_y.dtype)
