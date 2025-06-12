@@ -3,7 +3,7 @@ import torch
 import sys
 sys.path.append('/home/tachennf/Documents/MRI-pH-Hypoxia/torchcde')
 import torchcde
-
+import numpy as np
 
 ######################
 # A CDE model looks like
@@ -218,6 +218,45 @@ def get_data(num_timepoints=100):
     ######################
     return X, y
 
+def ivim_model(b, S0, f, d_slow, d_fast):
+    '''Standard IVIM model with both fast and slow diffusion coefficients as fitting parameters.
+
+    Parameters:
+    b (float): b-value
+    S0 (float): Signal intensity at b=0
+    f (float): perfusion fraction
+    d_slow (float): slow diffusion coefficient
+    d_fast (float): fast diffusion coefficient
+
+    Returns:
+    float: Signal intensity at b
+    '''
+    return S0 * (f * np.exp(-b*d_fast) + (1-f) * np.exp(-b*d_slow))
+
+def get_ivim_data(n_b_values: int = 7, sampling_size: int = 100):
+    D_slow_values = np.random.uniform(0.00035, 0.003, size=sampling_size)
+    D_fast_values = np.random.uniform(0.05, 0.01, size=sampling_size)
+    f_values = np.random.uniform(0.03, 0.25, size=sampling_size)
+    noise_levels = [5, 10, 20, 30, 40]
+    b_values = [np.array([0])]    
+    b_values.append(np.random.uniform(10, 50, size=int((n_b_values - 1)/2)))
+    b_values.append(np.random.uniform(50, 100, size=int((n_b_values - 1)/4)))
+    b_values.append(np.random.uniform(100, 800, size=int((n_b_values - 1)/3)))
+    b_values = np.sort(np.concatenate(b_values))
+    print(b_values)
+    X = np.zeros((D_slow_values.size*D_fast_values.size*f_values.size*len(noise_levels), n_b_values))
+
+    c = 0
+    for D_slow in D_slow_values:
+        for D_fast in D_fast_values:
+            for f in f_values:
+                for n in noise_levels:
+                    X[c, :] = ivim_model(b_values, 1.0, f, D_slow, D_fast) 
+                    c += 1
+                    for i in range(b_values.size): 
+                        X[c, i] = np.sqrt((X[c, i] + np.random.normal(0, X[c, 0]/n, size=1))**2 + np.random.normal(0, X[c, 0]/n, size=1)**2)
+                        
+    return X, b_values
 
 def main(num_epochs=30):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -265,4 +304,6 @@ def main(num_epochs=30):
 
 
 if __name__ == '__main__':
+    get_ivim_data()
+    quit()
     main()
