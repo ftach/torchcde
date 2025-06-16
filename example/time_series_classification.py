@@ -149,14 +149,17 @@ def main(num_epochs=30):
     # For most problems, it's probably easiest to save this tensor and treat it as the dataset.
     ######################
     train_coeffs = torchcde.hermite_cubic_coefficients_with_backward_differences(train_X)
-
+    print(train_coeffs.shape, train_X.shape, train_y.shape)
     train_dataset = torch.utils.data.TensorDataset(train_coeffs, train_y)
     train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=32)
     for epoch in range(num_epochs):
         for batch in train_dataloader:
             batch_coeffs, batch_y = batch
+            print(batch_coeffs.shape, batch_y.shape)
             pred_y = model(batch_coeffs).squeeze(-1)
+            print(pred_y.shape, batch_y.shape)
             loss = torch.nn.functional.binary_cross_entropy_with_logits(pred_y, batch_y)
+            quit()
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()

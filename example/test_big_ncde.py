@@ -4,6 +4,9 @@ import sys
 sys.path.append('/home/tachennf/Documents/MRI-pH-Hypoxia/torchcde')
 import torchcde
 import numpy as np
+from sklearn.model_selection import train_test_split
+from torch.utils.data import Dataset, DataLoader
+
 
 ######################
 # A CDE model looks like
@@ -184,93 +187,143 @@ class NeuralCDE(torch.nn.Module):
         pred_y = self.readout(X.interval, z_T) # readout is ltheta2
         return pred_y
     
-
-
-######################
-# Now we need some data.
-# Here we have a simple example which generates some spirals, some going clockwise, some going anticlockwise.
-######################
-def get_data(num_timepoints=100):
-    t = torch.linspace(0., 4 * math.pi, num_timepoints)
-
-    start = torch.rand(128) * 2 * math.pi
-    x_pos = torch.cos(start.unsqueeze(1) + t.unsqueeze(0)) / (1 + 0.5 * t)
-    x_pos[:64] *= -1
-    y_pos = torch.sin(start.unsqueeze(1) + t.unsqueeze(0)) / (1 + 0.5 * t)
-    x_pos += 0.01 * torch.randn_like(x_pos)
-    y_pos += 0.01 * torch.randn_like(y_pos)
-    ######################
-    # Easy to forget gotcha: time should be included as a channel; Neural CDEs need to be explicitly told the
-    # rate at which time passes. Here, we have a regularly sampled dataset, so appending time is pretty simple.
-    ######################
-    X = torch.stack([t.unsqueeze(0).repeat(128, 1), x_pos, y_pos], dim=2)
-    y = torch.zeros(128)
-    y[:64] = 1
-
-    perm = torch.randperm(128)
-    X = X[perm]
-    y = y[perm]
-
-    ######################
-    # X is a tensor of observations, of shape (batch=128, sequence=100, channels=3)
-    # y is a tensor of labels, of shape (batch=128,), either 0 or 1 corresponding to anticlockwise or clockwise
-    # respectively.
-    ######################
-    return X, y
-
-def ivim_model(b, S0, f, d_slow, d_fast):
+def ivim_model(b, S0, f, d_slow, d_fast, torch_based: bool = False):
     '''Standard IVIM model with both fast and slow diffusion coefficients as fitting parameters.
 
     Parameters:
-    b (float): b-value
-    S0 (float): Signal intensity at b=0
-    f (float): perfusion fraction
-    d_slow (float): slow diffusion coefficient
-    d_fast (float): fast diffusion coefficient
+    b (torch.Tensor): b-value tensor of shape [batch_size, num_b_values]
+    S0 (torch.Tensor): Signal intensity at b=0, tensor of shape [batch_size]
+    f (torch.Tensor): Perfusion fraction, tensor of shape [batch_size]
+    d_slow (torch.Tensor): Slow diffusion coefficient, tensor of shape [batch_size]
+    d_fast (torch.Tensor): Fast diffusion coefficient, tensor of shape [batch_size]
 
     Returns:
-    float: Signal intensity at b
+    torch.Tensor: Signal intensity at b, tensor of shape [batch_size, num_b_values]
     '''
-    return S0 * (f * np.exp(-b*d_fast) + (1-f) * np.exp(-b*d_slow))
+    if torch_based:
+        # Reshape S0, f, d_slow, and d_fast to [batch_size, 1, 1] for broadcasting
+        S0 = S0.view(-1, 1, 1)
+        f = f.view(-1, 1, 1)
+        d_slow = d_slow.view(-1, 1, 1)
+        d_fast = d_fast.view(-1, 1, 1)
 
-def get_ivim_data(n_b_values: int = 7, sampling_size: int = 100):
-    D_slow_values = np.random.uniform(0.00035, 0.003, size=sampling_size)
-    D_fast_values = np.random.uniform(0.05, 0.01, size=sampling_size)
-    f_values = np.random.uniform(0.03, 0.25, size=sampling_size)
-    noise_levels = [5, 10, 20, 30, 40]
+        # Perform element-wise operations
+        return S0 * (f * torch.exp(-b * d_fast) + (1 - f) * torch.exp(-b * d_slow))
+    else:
+        return S0 * (f * np.exp(-b * d_fast) + (1 - f) * np.exp(-b * d_slow))
+
+def get_random_b_values(n_b_values: int = 7):
+    '''Generate random b-values for IVIM fitting.
+
+    Parameters:
+    n_b_values (int): Number of b-values to generate
+
+    Returns:
+    np.ndarray: Array of random b-values
+    '''
     b_values = [np.array([0])]    
     b_values.append(np.random.uniform(10, 50, size=int((n_b_values - 1)/2)))
     b_values.append(np.random.uniform(50, 100, size=int((n_b_values - 1)/4)))
     b_values.append(np.random.uniform(100, 800, size=int((n_b_values - 1)/3)))
     b_values = np.sort(np.concatenate(b_values))
-    print(b_values)
-    X = np.zeros((D_slow_values.size*D_fast_values.size*f_values.size*len(noise_levels), n_b_values))
+    return b_values
 
-    c = 0
-    for D_slow in D_slow_values:
-        for D_fast in D_fast_values:
-            for f in f_values:
-                for n in noise_levels:
-                    X[c, :] = ivim_model(b_values, 1.0, f, D_slow, D_fast) 
-                    c += 1
-                    for i in range(b_values.size): 
-                        X[c, i] = np.sqrt((X[c, i] + np.random.normal(0, X[c, 0]/n, size=1))**2 + np.random.normal(0, X[c, 0]/n, size=1)**2)
+def get_ivim_data(param_ranges: list, n_b_values: int = 7, batch_size: int = 100):
+    '''Generate synthetic IVIM data for training and testing.
+
+    Parameters:
+    param_ranges (list): range of the parameters to simulate
+    n_b_values (int): Number of b-values to generate
+    sampling_size (int): Number of samples to generate for each combination of parameters
+
+    Returns:
+    X (np.ndarray): Generated IVIM data with shape (num_samples, n_b_values)
+    y (np.ndarray): Corresponding parameters for each sample with shape (num_samples, 4)
+    b_values (np.ndarray): Array of b-values used in the IVIM model
+    '''
+
+    S0_values = np.random.uniform(param_ranges[0][0], param_ranges[0][1], size=batch_size)
+    print(S0_values.shape)
+    f_values = np.random.uniform(param_ranges[1][0], param_ranges[1][1], size=batch_size)
+    D_slow_values = np.random.uniform(param_ranges[2][0], param_ranges[2][1], size=batch_size)
+    D_fast_values = np.random.uniform(param_ranges[3][0], param_ranges[3][1], size=batch_size)
+    noise_levels = [5, 10, 20, 30, 40]
+
+    # X is a tensor of observations, of shape (batch=128, sequence=100, channels=3)
+
+    X = np.zeros((batch_size, S0_values.size*D_slow_values.size*D_fast_values.size*f_values.size*len(noise_levels), n_b_values))
+    y = np.zeros((batch_size, 4)) # 4 because it's ivim data 
+    b_values = np.zeros((batch_size, S0_values.size*D_slow_values.size*D_fast_values.size*f_values.size*len(noise_levels), n_b_values))
+    print("Shape of X:", X.shape, "Shape of y:", y.shape, "Shape of b_values:", b_values.shape)
+    
+    i = 0 
+    while i < batch_size:
+        b_values_random = get_random_b_values(n_b_values)
+        for S0 in S0_values:
+            for D_slow in D_slow_values:
+                for D_fast in D_fast_values:
+                    for f in f_values:
+                        for n in noise_levels:
+                            b_values[i, :] = b_values_random
+                            signal = ivim_model(b_values[i, :], S0, f, D_slow, D_fast, torch_based=False)
+                            noisy_signal = np.sqrt((signal + np.random.normal(0, signal[0]/n))**2 + np.random.normal(0, signal[0]/n)**2)
+                            X[i, :] = noisy_signal
+                            y[i, 0] = S0
+                            y[i, 1] = f
+                            y[i, 2] = D_slow
+                            y[i, 3] = D_fast
+
+        i += 1
                         
-    return X, b_values
+    return X, y, b_values
 
-def main(num_epochs=30):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+# Custom Dataset Class
+class CustomDataset(Dataset):
+    def __init__(self, coeffs, X, y, b_values):
+        self.coeffs = coeffs
+        self.X = X
+        self.y = y
+        self.b_values = b_values
+
+    def __len__(self):
+        return len(self.y)
+
+    def __getitem__(self, idx):
+        return self.coeffs[idx], self.X[idx], self.y[idx], self.b_values[idx]
+    
+def rescale_out_params(param_ranges: list, y_pred: torch.Tensor) -> torch.Tensor: 
+    '''Rescale output parameters of the network as y_scaled = y_min + sigmoid(y_pred)(y_max - y_min). 
+    
+    Parameters
+    param_ranges (list): list of the min and max values used to simulate parameters
+    y_pred (torch.Tensor): predictions of the neural network
+    
+    Returns 
+    y_scaled (torch.Tensor): rescaled predictions 
+    '''
+    y_scaled = torch.zeros(y_pred.shape)
+    for i in range(y_pred.shape[-1]): 
+        y_scaled[:, i] = param_ranges[i][0] + torch.sigmoid(y_pred[:, i])(param_ranges[i][1] - param_ranges[i][0])
+
+    return y_scaled
+
+def main(param_ranges: list, num_epochs: int = 30, n_b_values: int = 7, batch_size: int = 50):
+    device = 'cpu' # torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print('Using device:', device)
 
-    train_X, train_y = get_data()
-    train_X = train_X.to(device)
-    train_y = train_y.to(device)
+    X, y, b_values = get_ivim_data(param_ranges, n_b_values=n_b_values, batch_size=batch_size)
+    X_train, X_test, y_train, y_test, b_values_train, b_values_test = train_test_split(X, y, b_values, test_size=0.33, random_state=42)
+    X_train = torch.Tensor(X_train).to(device)
+    y_train = torch.Tensor(y_train).to(device)
+    b_values_train = torch.Tensor(b_values_train).to(device)
+
     ######################
     # input_channels=3 because we have both the horizontal and vertical position of a point in the spiral, and time.
     # hidden_channels=8 is the number of hidden channels for the evolving z_t, which we get to choose.
     # output_channels=1 because we're doing binary classification.
     ######################
-    model = NeuralCDE(input_channels=3, hidden_channels=8, output_channels=1).to(device)
+    # TODO: correct batchnorm in NeuralCDE, might need 2D 
+    model = NeuralCDE(input_channels=n_b_values, hidden_channels=100, output_channels=4).to(device)
     optimizer = torch.optim.Adam(model.parameters())
 
     ######################
@@ -278,32 +331,33 @@ def main(num_epochs=30):
     # The resulting `train_coeffs` is a tensor describing the path.
     # For most problems, it's probably easiest to save this tensor and treat it as the dataset.
     ######################
-    train_coeffs = torchcde.hermite_cubic_coefficients_with_backward_differences(train_X)
+    ########### TRAIN ##########
+    train_coeffs = torchcde.natural_cubic_spline_coeffs(X_train)
+    print(train_coeffs.shape, X_train.shape, y_train.shape, b_values_train.shape)
 
-    train_dataset = torch.utils.data.TensorDataset(train_coeffs, train_y)
-    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=32)
+    train_dataset = CustomDataset(train_coeffs, X_train, y_train, b_values_train)
+    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     for epoch in range(num_epochs):
         for batch in train_dataloader:
-            batch_coeffs, batch_y = batch
-            pred_y = model(batch_coeffs).squeeze(-1)
-            loss = torch.nn.functional.binary_cross_entropy_with_logits(pred_y, batch_y)
+            batch_coeffs, batch_x, batch_y, batch_b_values = batch
+            y_pred = model(batch_coeffs) # .squeeze(-1)
+            s_pred = ivim_model(batch_b_values, y_pred[:, 0], y_pred[:, 1], y_pred[:, 2], y_pred[:, 3], torch_based=True)
+            loss = torch.nn.functional.mse_loss(y_pred, batch_y) + 1/n_b_values * torch.sum(torch.pow((batch_x-s_pred), 2)) # Add a physics informed loss
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
         print('Epoch: {}   Training loss: {}'.format(epoch, loss.item()))
 
-    test_X, test_y = get_data()
-    test_X = test_X.to(device)
-    test_y = test_y.to(device)
-    test_coeffs = torchcde.hermite_cubic_coefficients_with_backward_differences(test_X)
-    pred_y = model(test_coeffs).squeeze(-1)
-    binary_prediction = (torch.sigmoid(pred_y) > 0.5).to(test_y.dtype)
-    prediction_matches = (binary_prediction == test_y).to(test_y.dtype)
-    proportion_correct = prediction_matches.sum() / test_y.size(0)
-    print('Test Accuracy: {}'.format(proportion_correct))
+    ########### TEST ##########
+    X_test = torch.Tensor(X_test).to(device)
+    y_test = torch.Tensor(y_test).to(device)
+    test_coeffs = torchcde.natural_cubic_spline_coeffs(X_test) ## Apply splines
+    y_pred = model(test_coeffs).squeeze(-1)
+    y_scaled = rescale_out_params(param_ranges, y_pred) 
+    squared_error = torch.sum(torch.pow((y_scaled - y_test), 2))
+    print('Test MSE: {}'.format(squared_error))
 
 
 if __name__ == '__main__':
-    get_ivim_data()
-    quit()
-    main()
+    param_ranges = [[0.95, 1.05], [0.03, 0.25], [0.00035, 0.003], [0.05, 0.01]] # S0, f, D, D*
+    main(param_ranges, batch_size=8)
